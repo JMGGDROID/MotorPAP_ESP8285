@@ -2,6 +2,8 @@
 
 Firmware para controlar un motor paso a paso desde un navegador en la red local. El ESP8285 configura y consulta el TMC5160 por SPI y genera los pulsos `STEP` con el temporizador Timer1. El panel web permite mover el motor en ambos sentidos, ajustar la velocidad durante el movimiento y consultar el estado del driver.
 
+![Panel web de control del motor paso a paso](./web.png)
+
 ## Conexiones
 
 Los nombres `D0` a `D8` corresponden al entorno `d1_mini_pro` de PlatformIO. Si tu placa usa números GPIO, sigue la columna central.
@@ -40,14 +42,16 @@ pio device monitor -e d1_mini_pro
 
 Las credenciales se guardan en LittleFS después de establecer la conexión y se reutilizan al arrancar. Si la conexión o la reconexión falla durante 25 segundos, vuelve a aparecer el menú de redes.
 
+El panel muestra la dirección IP, el tiempo de actividad y la intensidad de señal en dBm. El navegador espera **500 ms** entre ciclos de consulta de estado. El ESP mide la señal en la primera consulta y reutiliza la última lectura durante **10 segundos**. Si falla la consulta de estado, el indicador de señal muestra **Sin datos**.
+
 ## Mover el motor
 
-1. Con el driver en **OFF**, selecciona la resolución de micropasos, configura la corriente de marcha y elige si quieres activar **StealthChop2**.
+1. Con el driver en **OFF**, ajusta la corriente de marcha y pulsa **Aplicar** en **Corriente del motor**, justo debajo de **Habilitar driver**. En ese panel también se muestra la corriente de mantenimiento calculada. Selecciona los micropasos y, si quieres cambiar de **SpreadCycle** a **StealthChop2**, activa **Modo silencioso**.
 2. Pon el driver en **ON**. El firmware comprueba por SPI que el TMC5160 responde, que está en modo `STEP/DIR` y que se puede habilitar. Con StealthChop2 activado, espera a que termine el ajuste inicial antes de mover el motor.
 3. Ajusta la velocidad y los tiempos de aceleración y deceleración. Pulsa **Mover +** o **Mover −** para iniciar el giro continuo (jog). **Mover +** sigue el sentido seleccionado en el panel y **Mover −** usa el opuesto. Puedes cambiar de velocidad durante el giro. Si inviertes el sentido, el firmware frena hasta detenerse y acelera en la dirección nueva.
 4. Pulsa **STOP** para frenar con la rampa configurada y mantener el driver habilitado. Cambia a **OFF** para cortar los pulsos y deshabilitar la salida inmediatamente.
 
-El panel renueva periódicamente el permiso de movimiento. Si el firmware pasa unos **3 segundos** sin recibir una renovación durante un jog, corta los pulsos y deshabilita el driver. También deshabilita el driver al detectar que ha perdido la conexión Wi-Fi mientras el servidor está activo.
+Durante un jog, el navegador envía una renovación (`keepalive`) en cada ciclo de consulta. Si el firmware pasa unos **3 segundos** sin recibir una renovación, corta los pulsos y deshabilita el driver. También deshabilita el driver al detectar que ha perdido la conexión Wi-Fi mientras el servidor está activo.
 
 | Ajuste | Valores |
 | --- | --- |
@@ -57,21 +61,21 @@ El panel renueva periódicamente el permiso de movimiento. Si el firmware pasa u
 | Corriente de marcha | De 0,10 a 1,20 A RMS en incrementos de 0,01 A. Valor inicial de 0,80 A RMS. |
 | Corriente de mantenimiento | Calculada a partir del ajuste de marcha, con un límite de 0,40 A RMS. |
 
-La conversión a RPM supone un motor de **200 pasos completos por vuelta**. Los ajustes del motor se restablecen al reiniciar el ESP. Las funciones disponibles de movimiento son el jog y la parada. Los controles de inicio, posicionamiento y gráfica están reservados en la interfaz.
+La conversión a RPM supone un motor de **200 pasos completos por vuelta**. A 16 micropasos, el límite de 550 RPM equivale a **29.333 micropasos/s**. Los ajustes del motor se restablecen al reiniciar el ESP y el driver arranca deshabilitado, con SpreadCycle seleccionado. Las funciones disponibles de movimiento son el jog y la parada. Los controles de inicio, posicionamiento y gráfica están reservados en la interfaz.
 
 ## Diagnóstico
 
-- El panel muestra si el TMC5160 responde, el estado de `EN`, la temperatura, la subtensión, los cortocircuitos y los fallos del driver. La lectura de StallGuard está disponible a partir de 10 RPM, con el driver habilitado, en movimiento y fuera de StealthChop.
+- El firmware comprueba por SPI el estado del TMC5160 aproximadamente cada **segundo**. El panel muestra si responde, el estado de `EN`, el preaviso térmico o la sobretemperatura, la subtensión, los cortocircuitos y los fallos del driver. La lectura de StallGuard está disponible a partir de 10 RPM, con el driver habilitado, en movimiento y fuera de StealthChop.
 - El monitor serie informa de la identificación SPI y muestra el registro `IOIN`. Si el panel indica **Sin identificar**, revisa `CS`, el cableado SPI y la alimentación del módulo. Si el driver aparece detectado pero no se habilita, comprueba `EN` y el modo `STEP/DIR`.
 
 ## Organización del código
 
-| Archivo | Función |
-| --- | --- |
-| [`src/main.cpp`](src/main.cpp) | Inicialización y bucle principal. |
-| [`src/Tmc5160.cpp`](src/Tmc5160.cpp) | Configuración SPI, diagnóstico, corriente y generación de pulsos y rampas. |
-| [`src/MotorWebServer.cpp`](src/MotorWebServer.cpp) | Servidor HTTP en el puerto 80 y rutas `/api/` para consultar y controlar el motor. |
-| [`include/MotorPanel.h`](include/MotorPanel.h) | HTML, CSS y JavaScript del panel integrado en el firmware. |
-| [`src/WifiMenu.cpp`](src/WifiMenu.cpp) | Escaneo y selección de redes desde el puerto serie. |
-| [`src/WifiConnection.cpp`](src/WifiConnection.cpp) | Conexión Wi-Fi en modo estación y gestión de la reconexión. |
-| [`src/WifiStorage.cpp`](src/WifiStorage.cpp) | Lectura y escritura de las credenciales en LittleFS. |
+| Código | Cabecera | Función |
+| --- | --- | --- |
+| [`main.cpp`](src/main.cpp) | — | Inicialización y bucle principal. |
+| [`Tmc5160.cpp`](src/Tmc5160.cpp) | [`Tmc5160.h`](include/Tmc5160.h) | Configuración SPI, diagnóstico, corriente y generación de pulsos y rampas. |
+| [`MotorWebServer.cpp`](src/MotorWebServer.cpp) | [`MotorWebServer.h`](include/MotorWebServer.h) | Servidor HTTP en el puerto 80 y rutas `/api/` para consultar y controlar el motor. |
+| — | [`MotorPanel.h`](include/MotorPanel.h) | HTML, CSS y JavaScript del panel integrado en el firmware. |
+| [`WifiMenu.cpp`](src/WifiMenu.cpp) | [`WifiMenu.h`](include/WifiMenu.h) | Escaneo y selección de redes desde el puerto serie. |
+| [`WifiConnection.cpp`](src/WifiConnection.cpp) | [`WifiConnection.h`](include/WifiConnection.h) | Conexión Wi-Fi en modo estación y gestión de la reconexión. |
+| [`WifiStorage.cpp`](src/WifiStorage.cpp) | [`WifiStorage.h`](include/WifiStorage.h) | Lectura y escritura de las credenciales en LittleFS. |
