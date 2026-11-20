@@ -1,3 +1,4 @@
+// Gestiona la configuración Wi-Fi desde el monitor serie.
 #include "WifiMenu.h"
 
 #include <ESP8266WiFi.h>
@@ -8,6 +9,7 @@
 
 namespace
 {
+// Distingue si se espera un número de red, una clave o ningún dato del menú.
 enum class State { Inactive, SelectNetwork, EnterPassword };
 
 State state = State::Inactive;
@@ -17,6 +19,7 @@ String serialInput;
 bool inputTooLong = false;
 bool previousWasCr = false;
 
+// Entrega a la conexión la red elegida y libera la lista del escaneo.
 void connectToNetwork(const char* password)
 {
     const String ssid = WiFi.SSID(selectedNetwork);
@@ -26,6 +29,7 @@ void connectToNetwork(const char* password)
     state = State::Inactive;
 }
 
+// Interpreta la línea según el estado del menú y valida el número de red antes de usarlo.
 void handleSerialLine()
 {
     if (inputTooLong)
@@ -47,11 +51,6 @@ void handleSerialLine()
     }
 
     serialInput.trim();
-    if (state == State::Inactive && serialInput.equalsIgnoreCase("PRUEBA08"))
-    {
-        Tmc5160::testMotor();
-        return;
-    }
     if (serialInput.equalsIgnoreCase("r"))
     {
         WifiMenu::showNetworks();
@@ -84,11 +83,13 @@ void handleSerialLine()
 }
 }
 
+// Preasigna memoria para la contraseña.
 void WifiMenu::begin()
 {
     serialInput.reserve(WifiCredentials::maxPasswordLength);
 }
 
+// Deja el motor deshabilitado durante el escaneo y muestra señal, canal y tipo de red.
 void WifiMenu::showNetworks()
 {
     Tmc5160::disable();
@@ -114,6 +115,7 @@ void WifiMenu::showNetworks()
     Serial.println("Envia el numero de la red y pulsa Enter, o R para volver a buscar.");
 }
 
+// Limita la longitud y trata CRLF como un único final de línea.
 void WifiMenu::update()
 {
     while (Serial.available() > 0)

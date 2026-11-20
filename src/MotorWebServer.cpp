@@ -1,3 +1,4 @@
+// Implementa el panel HTTP y traduce sus peticiones en operaciones sobre el TMC5160.
 #include "MotorWebServer.h"
 
 #include <ESP8266WebServer.h>
@@ -8,12 +9,31 @@
 
 namespace
 {
+// El servidor escucha en el puerto 80. Cada sesión Jog usa un identificador para asociar sus órdenes.
 ESP8266WebServer server(80);
 bool running = false;
 unsigned long jogId = 0;
 bool clockwise = true;
 constexpr char commandHeader[] = "X-MotorPAP-Command";
+constexpr unsigned long wifiSignalIntervalMs = 10000;
 
+// Toma una muestra en la primera consulta y reutiliza el valor durante diez segundos.
+int32_t wifiSignal()
+{
+    static bool hasSample = false;
+    static unsigned long sampledAt = 0;
+    static int32_t signal = 0;
+    const unsigned long now = millis();
+    if (!hasSample || now - sampledAt >= wifiSignalIntervalMs)
+    {
+        signal = WiFi.RSSI();
+        sampledAt = now;
+        hasSample = true;
+    }
+    return signal;
+}
+
+// Devuelve al navegador los límites que corresponden a la resolución configurada.
 void sendMotionLimits()
 {
     char response[160];
@@ -26,6 +46,7 @@ void sendMotionLimits()
     server.send(200, "application/json", response);
 }
 
+// Valida la velocidad en micropasos por segundo y responde con HTTP 400 si queda fuera del rango.
 uint32_t requestSpeed()
 {
     const String speedArgument = server.arg("speed");
@@ -43,6 +64,7 @@ uint32_t requestSpeed()
     return speed;
 }
 
+// Inicia un Jog o cambia el sentido del existente cuando la petición incluye su identificador.
 void jog(bool positive)
 {
     if (server.header(commandHeader) != "1")
@@ -134,12 +156,14 @@ void jog(bool positive)
 }
 }
 
+// Registra la página y los endpoints de lectura y control.
 void MotorWebServer::begin()
 {
     server.collectHeaders(commandHeader);
     server.on("/", HTTP_GET, []() {
         server.send_P(200, PSTR("text/html; charset=utf-8"), motorPanelHtml);
     });
+    // Entrega señal, tiempo activo, límites, estado del motor y diagnóstico en un JSON.
     server.on("/api/status", HTTP_GET, []() {
         const auto driver = Tmc5160::status();
         char response[680];
@@ -154,7 +178,7 @@ void MotorWebServer::begin()
                  "\"silentInitializing\":%s,\"silentActive\":%s,"
                  "\"diagnosticsAvailable\":%s,\"overtemperature\":%s,\"temperatureWarning\":%s,"
                  "\"undervoltage\":%s,\"driverError\":%s,\"shortCircuit\":%s,\"stallGuardResult\":%d}",
-                 WiFi.localIP().toString().c_str(), WiFi.RSSI(), millis() / 1000,
+                 WiFi.localIP().toString().c_str(), wifiSignal(), millis() / 1000,
                  driver.responding ? "true" : "false", driver.outputDisabled ? "true" : "false",
                  Tmc5160::isEnabled() ? "true" : "false",
                  driver.stepDirMode ? "true" : "false", Tmc5160::isMoving() ? "true" : "false",
@@ -177,8 +201,10 @@ void MotorWebServer::begin()
         server.sendHeader("Cache-Control", "no-store");
         server.send(200, "application/json", response);
     });
+    // Los dos botones Jog usan la misma lógica con sentidos opuestos respecto a la selección.
     server.on("/api/jog/negative", HTTP_POST, []() { jog(false); });
     server.on("/api/jog/positive", HTTP_POST, []() { jog(true); });
+    // Actualiza la referencia de sentido usada por los botones Jog.
     server.on("/api/direction", HTTP_POST, []() {
         if (server.header(commandHeader) != "1")
         {
@@ -203,6 +229,7 @@ void MotorWebServer::begin()
         clockwise = positive;
         server.send(204);
     });
+    // Valida la resolución y devuelve los límites de movimiento recalculados.
     server.on("/api/microsteps", HTTP_POST, []() {
         if (server.header(commandHeader) != "1")
         {
@@ -224,6 +251,7 @@ void MotorWebServer::begin()
         }
         sendMotionLimits();
     });
+    // Procesa el interruptor de habilitación de la salida del driver.
     server.on("/api/driver", HTTP_POST, []() {
         if (server.header(commandHeader) != "1")
         {
@@ -250,6 +278,7 @@ void MotorWebServer::begin()
         }
         server.send(204);
     });
+    // Recibe la corriente de marcha en miliamperios y delega su validación al driver.
     server.on("/api/current", HTTP_POST, []() {
         if (server.header(commandHeader) != "1")
         {
@@ -275,6 +304,7 @@ void MotorWebServer::begin()
                  unsigned(Tmc5160::runCurrentMa()), unsigned(Tmc5160::holdCurrentMa()));
         server.send(200, "application/json", response);
     });
+    // Permite solicitar el modo silencioso del driver.
     server.on("/api/silent-mode", HTTP_POST, []() {
         if (server.header(commandHeader) != "1")
         {
@@ -295,6 +325,7 @@ void MotorWebServer::begin()
         server.send(200, "application/json", value == "1" ? "{\"silentMode\":true}"
                                                            : "{\"silentMode\":false}");
     });
+    // Renueva el plazo del movimiento si el identificador coincide con el Jog actual.
     server.on("/api/jog/keepalive", HTTP_POST, []() {
         if (server.header(commandHeader) != "1")
         {
@@ -308,6 +339,7 @@ void MotorWebServer::begin()
         }
         server.send(204);
     });
+    // Cambia la velocidad del Jog vigente sin iniciar otro movimiento.
     server.on("/api/jog/speed", HTTP_POST, []() {
         if (server.header(commandHeader) != "1")
         {
@@ -326,6 +358,7 @@ void MotorWebServer::begin()
         }
         server.send(204);
     });
+    // Solicita una parada con la deceleración configurada.
     server.on("/api/stop", HTTP_POST, []() {
         if (server.header(commandHeader) != "1")
         {
@@ -337,6 +370,7 @@ void MotorWebServer::begin()
     });
 }
 
+// Arranca HTTP al conectar. Si cae la red, deshabilita el motor y detiene HTTP.
 void MotorWebServer::update(bool wifiOnline)
 {
     if (!wifiOnline)

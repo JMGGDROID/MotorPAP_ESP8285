@@ -1,3 +1,4 @@
+// Gestiona los intentos de conexión, la reconexión automática y el guardado de redes válidas.
 #include "WifiConnection.h"
 
 #include <ESP8266WiFi.h>
@@ -6,6 +7,7 @@
 
 namespace
 {
+// Distingue entre inactividad, conexión pendiente y conexión activa.
 enum class State { Idle, Connecting, Online };
 
 constexpr unsigned long connectionTimeout = 25000;
@@ -14,6 +16,7 @@ unsigned long connectionStarted = 0;
 bool saveAfterConnecting = false;
 WifiCredentials credentials{};
 
+// Inicia el intento sin esperar en un bucle y guarda el instante de inicio para controlar el plazo.
 void startConnection(int32_t channel = 0, const uint8_t* bssid = nullptr)
 {
     Serial.print("Conectando a ");
@@ -25,6 +28,7 @@ void startConnection(int32_t channel = 0, const uint8_t* bssid = nullptr)
 }
 }
 
+// Configura el modo estación y busca en LittleFS la red del arranque anterior.
 bool WifiConnection::begin()
 {
     WiFi.persistent(false);
@@ -46,6 +50,7 @@ bool WifiConnection::begin()
     return true;
 }
 
+// Cancela el intento y evita guardar credenciales de una conexión abandonada.
 void WifiConnection::disconnect()
 {
     WiFi.disconnect();
@@ -53,6 +58,7 @@ void WifiConnection::disconnect()
     state = State::Idle;
 }
 
+// Copia las credenciales al estado del módulo y aplaza su guardado hasta que la conexión funcione.
 void WifiConnection::connect(const char* ssid, const char* password, int32_t channel,
                              const uint8_t* bssid)
 {
@@ -63,6 +69,7 @@ void WifiConnection::connect(const char* ssid, const char* password, int32_t cha
     startConnection(channel, bssid);
 }
 
+// Supervisa la reconexión, confirma la red nueva y avisa al bucle principal si vence el plazo.
 bool WifiConnection::update()
 {
     if (state == State::Online && WiFi.status() != WL_CONNECTED)
@@ -96,6 +103,7 @@ bool WifiConnection::update()
     return false;
 }
 
+// Expone el estado que el servidor usa para arrancar o detenerse.
 bool WifiConnection::isOnline()
 {
     return state == State::Online;

@@ -1,3 +1,4 @@
+// Controla el TMC5160 por SPI y genera los pulsos STEP/DIR del motor mediante Timer1.
 #include "Tmc5160.h"
 
 #include <Arduino.h>
@@ -6,10 +7,12 @@
 
 namespace
 {
+// Pines de selección SPI, habilitación activa en bajo y control STEP/DIR.
 constexpr uint8_t chipSelectPin = D1;
 constexpr uint8_t enablePin = D2;
 constexpr uint8_t stepPin = D0;
 constexpr uint8_t directionPin = D8;
+// Direcciones de registros SPI y máscaras de configuración y diagnóstico.
 constexpr uint8_t ioinRegister = 0x04;
 constexpr uint8_t globalConfigRegister = 0x00;
 constexpr uint8_t globalStatusRegister = 0x01;
@@ -37,19 +40,21 @@ constexpr uint8_t microstepResolutionShift = 24;
 constexpr uint8_t expectedVersion = 0x30;
 constexpr uint32_t enableInputMask = 1UL << 4;
 constexpr uint32_t stepDirModeMask = 1UL << 6;
+// Cadencias del diagnóstico, las rampas y el límite de tiempo sin heartbeat del Jog.
 constexpr unsigned long pollInterval = 1000;
-constexpr uint16_t jogPulses = 160;
 constexpr uint32_t timerFrequency = 80000000; // Timer1 sin divisor.
 constexpr uint32_t commandTimeoutSeconds = 3;
 constexpr uint32_t keepaliveTicks = timerFrequency * commandTimeoutSeconds;
 constexpr unsigned long rampInterval = 2;
 constexpr uint32_t startupTick = timerFrequency / 1000;
 constexpr uint32_t maxTimerTicks = 0x7FFFFF;
+// Escala de corriente RMS usada para traducir miliamperios a los registros del driver.
 constexpr uint32_t fullScaleRmsMicroamps = 3064129; // 0,325 V / 0,075 ohm / sqrt(2).
 constexpr uint32_t currentScale = 256U * 32U;
 constexpr uint16_t holdLimitMa = 400;
 const SPISettings driverSpi(500000, MSBFIRST, SPI_MODE3);
 
+// Agrupa el escalador global y los niveles de corriente de marcha y mantenimiento.
 struct CurrentSettings
 {
     uint16_t scaler;
@@ -57,11 +62,13 @@ struct CurrentSettings
     uint8_t hold;
 };
 
+// Convierte el límite en miliamperios a un límite para el producto de las escalas.
 uint32_t currentProductLimit(uint16_t milliamps)
 {
     return uint64_t(milliamps) * 1000 * currentScale / fullScaleRmsMicroamps;
 }
 
+// Calcula los valores de registro que representan las corrientes solicitadas.
 CurrentSettings calculateCurrent(uint16_t milliamps)
 {
     const uint32_t limit = currentProductLimit(milliamps);
@@ -91,7 +98,7 @@ unsigned long quietSetupStarted = 0;
 uint32_t quietHoldConfig = 0;
 bool enableOutput(const CurrentSettings& current, bool quiet);
 
-volatile uint32_t halfPeriodsRemaining = 0;
+// Estado compartido entre el temporizador de pasos y el bucle principal.
 volatile uint32_t ticksUntilTimeout = 0;
 volatile uint32_t activeHalfPeriod = 0;
 volatile uint32_t requestedHalfPeriod = 0;
@@ -100,7 +107,6 @@ volatile bool waitingForFirstStep = false;
 volatile bool stepHigh = false;
 volatile bool moving = false;
 volatile bool outputCommanded = false;
-volatile bool continuousJog = false;
 uint32_t targetSpeed = 0;
 uint32_t selectedJogSpeed = 0;
 bool activeDirection = false;
@@ -117,9 +123,8 @@ uint8_t microstepResolution = 4; // MRES=4 corresponde a 16 micropasos.
 Tmc5160::Status currentStatus{};
 unsigned long lastPoll = 0;
 bool firstPoll = true;
-bool serialTestRunning = false;
-uint32_t serialTestStartCounter = 0;
 
+// Detiene el temporizador y deja STEP en bajo. Puede deshabilitar también la salida.
 void IRAM_ATTR stopPulses(bool disableOutput)
 {
     if (disableOutput)
@@ -133,6 +138,7 @@ void IRAM_ATTR stopPulses(bool disableOutput)
     moving = false;
 }
 
+// Supervisa el plazo del Jog y alterna STEP. Aplica el nuevo período al completar un pulso.
 void IRAM_ATTR onStepTimer()
 {
     if (!moving)
@@ -140,15 +146,12 @@ void IRAM_ATTR onStepTimer()
         return;
     }
 
-    if (continuousJog)
+    if (ticksUntilTimeout <= activeHalfPeriod)
     {
-        if (ticksUntilTimeout <= activeHalfPeriod)
-        {
-            stopPulses(true);
-            return;
-        }
-        ticksUntilTimeout -= activeHalfPeriod;
+        stopPulses(true);
+        return;
     }
+    ticksUntilTimeout -= activeHalfPeriod;
 
     if (waitingForFirstStep)
     {
@@ -178,12 +181,6 @@ void IRAM_ATTR onStepTimer()
         GP16O |= 1U;
     }
     stepHigh = !stepHigh;
-    if (!continuousJog && --halfPeriodsRemaining == 0)
-    {
-        stopPulses(true);
-        return;
-    }
-
     if (!stepHigh && activeHalfPeriod != requestedHalfPeriod)
     {
         activeHalfPeriod = requestedHalfPeriod;
@@ -191,6 +188,7 @@ void IRAM_ATTR onStepTimer()
     }
 }
 
+// Envía una trama SPI con un byte de dirección y cuatro bytes de datos.
 uint32_t transferRegister(uint8_t address, uint32_t data = 0)
 {
     digitalWrite(chipSelectPin, LOW);
@@ -206,6 +204,7 @@ uint32_t transferRegister(uint8_t address, uint32_t data = 0)
     return value;
 }
 
+// Hace dos transferencias porque el TMC5160 devuelve la lectura en la trama siguiente.
 uint32_t readRegister(uint8_t address)
 {
     SPI.beginTransaction(driverSpi);
@@ -216,6 +215,7 @@ uint32_t readRegister(uint8_t address)
     return value;
 }
 
+// Activa el bit de escritura de la dirección antes de enviar el valor.
 void writeRegister(uint8_t address, uint32_t value)
 {
     SPI.beginTransaction(driverSpi);
@@ -223,14 +223,14 @@ void writeRegister(uint8_t address, uint32_t value)
     SPI.endTransaction();
 }
 
+// Convierte la velocidad de pulsos por segundo al intervalo entre flancos de STEP.
 uint32_t halfPeriodForSpeed(uint32_t speed)
 {
     const uint32_t frequency = 2UL * speed;
     return (timerFrequency + frequency - 1) / frequency;
 }
 
-bool startMotion(bool positive, uint32_t speed, uint32_t rampMs);
-
+// Obtiene la velocidad de pulso actual a partir del período activo.
 uint32_t pulseSpeed()
 {
     noInterrupts();
@@ -240,12 +240,14 @@ uint32_t pulseSpeed()
     return pulsing ? (timerFrequency + period) / (2UL * period) : 0;
 }
 
+// Calcula la espera inicial antes del primer paso al acelerar desde reposo.
 uint32_t firstStepDelay(uint32_t speed, uint32_t durationMs)
 {
     // Desde reposo, el primer impulso llega cuando la rampa ha recorrido un micropaso.
     return static_cast<uint32_t>(ceil(sqrt(2000.0 * durationMs / speed)) * startupTick);
 }
 
+// Guarda las velocidades de origen y destino y la duración de la nueva rampa.
 void setSpeedRamp(uint32_t from, uint32_t to, uint32_t durationMs)
 {
     rampFromSpeed = from;
@@ -255,6 +257,7 @@ void setSpeedRamp(uint32_t from, uint32_t to, uint32_t durationMs)
     rampFinished = false;
 }
 
+// Cambia el sentido cuando ya no hay pulsos y arranca la rampa hacia la velocidad elegida.
 bool restartJogFromRest()
 {
     const uint32_t firstDelay = firstStepDelay(selectedJogSpeed, jogRampMs);
@@ -290,9 +293,10 @@ bool restartJogFromRest()
     return true;
 }
 
+// Interpola la velocidad y aplica el final de rampa, incluida la parada o la inversión.
 void updateRamp(unsigned long now)
 {
-    if (!moving || !continuousJog || rampFinished ||
+    if (!moving || rampFinished ||
         now - lastRampUpdate < rampInterval)
     {
         return;
@@ -325,17 +329,20 @@ void updateRamp(unsigned long now)
     }
 }
 
+// Comprueba la identidad del chip y que acepte señales STEP/DIR.
 bool validStepDir(uint32_t ioin)
 {
     return (ioin >> 24) == expectedVersion && (ioin & stepDirModeMask) != 0;
 }
 
+// Combina el valor base de CHOPCONF con el campo de resolución de micropasos.
 uint32_t chopperConfig()
 {
     return chopperBase | (static_cast<uint32_t>(microstepResolution) << microstepResolutionShift);
 }
 }
 
+// Prepara los pines con la salida deshabilitada, arranca SPI y conecta la interrupción de Timer1.
 void Tmc5160::begin()
 {
     digitalWrite(enablePin, HIGH);
@@ -350,17 +357,9 @@ void Tmc5160::begin()
     timer1_attachInterrupt(onStepTimer);
 }
 
+// Atiende la rampa, completa el ajuste silencioso y comprueba periódicamente el enlace SPI y los diagnósticos.
 void Tmc5160::update()
 {
-    if (serialTestRunning && !isMoving())
-    {
-        const uint32_t counter = readRegister(microstepCounterRegister);
-        Serial.printf("PRUEBA08 terminada: MSCNT %lu -> %lu.\n",
-                      static_cast<unsigned long>(serialTestStartCounter),
-                      static_cast<unsigned long>(counter));
-        serialTestRunning = false;
-    }
-
     const unsigned long now = millis();
     if (quietSetupPending && outputCommanded && now - quietSetupStarted >= quietSetupMs)
     {
@@ -382,6 +381,7 @@ void Tmc5160::update()
     const uint32_t globalStatus = responding ? readRegister(globalStatusRegister) : UINT32_MAX;
     const bool hasDiagnostics = driverStatus != UINT32_MAX && globalStatus <= 7;
     const bool silentActive = hasDiagnostics && (driverStatus & quietActiveMask) != 0;
+    // StallGuard requiere movimiento suficiente, salida activa y un modo de regulación compatible.
     const bool stallGuardAvailable = hasDiagnostics && outputCommanded && !outputDisabled &&
         (driverStatus & (quietActiveMask | standstillMask)) == 0 &&
         pulseSpeed() * 60 >= uint32_t(stallGuardMinRpm) * motorStepsPerRevolution * microsteps();
@@ -413,30 +413,15 @@ void Tmc5160::update()
     firstPoll = false;
 }
 
+// Devuelve la última lectura de diagnóstico.
 Tmc5160::Status Tmc5160::status()
 {
     return currentStatus;
 }
 
-void Tmc5160::testMotor()
-{
-    const uint32_t counter = readRegister(microstepCounterRegister);
-    if (!outputCommanded && enableOutput(calculateCurrent(defaultRunCurrentMa), false))
-    {
-        if (startMotion(false, 100, 0))
-        {
-            serialTestStartCounter = counter;
-            serialTestRunning = true;
-            Serial.println("PRUEBA08 iniciada: 0,8 A RMS nominales, 160 pulsos a 100 Hz.");
-            return;
-        }
-        disable();
-    }
-    Serial.println("PRUEBA08 cancelada: driver ocupado, habilitado o configuracion incorrecta.");
-}
-
 namespace
 {
+// Configura el sentido, prepara el temporizador y lanza la rampa desde reposo.
 bool startMotion(bool positive, uint32_t speed, uint32_t rampMs)
 {
     if (moving || !outputCommanded || quietSetupPending || speed < Tmc5160::minJogSpeed ||
@@ -458,15 +443,13 @@ bool startMotion(bool positive, uint32_t speed, uint32_t rampMs)
     activeDirection = requestedDirection = positive;
     reversing = false;
     selectedJogSpeed = speed;
-    continuousJog = rampMs != 0;
     jogRampMs = rampMs;
     setSpeedRamp(0, speed, rampMs);
-    halfPeriodsRemaining = 2UL * jogPulses;
     ticksUntilTimeout = keepaliveTicks;
-    waitingForFirstStep = continuousJog;
-    firstStepTicksRemaining = continuousJog ? firstStepDelay(speed, rampMs) : 0;
-    activeHalfPeriod = continuousJog ? startupTick : halfPeriodForSpeed(speed);
-    requestedHalfPeriod = continuousJog ? 0 : activeHalfPeriod;
+    waitingForFirstStep = true;
+    firstStepTicksRemaining = firstStepDelay(speed, rampMs);
+    activeHalfPeriod = startupTick;
+    requestedHalfPeriod = 0;
     moving = true;
     timer1_enable(TIM_DIV1, TIM_EDGE, TIM_LOOP);
     timer1_write(activeHalfPeriod);
@@ -476,6 +459,7 @@ bool startMotion(bool positive, uint32_t speed, uint32_t rampMs)
 
 namespace
 {
+// Configura los registros de corriente y regulación y comprueba la habilitación de la salida.
 bool enableOutput(const CurrentSettings& current, bool quiet)
 {
     const uint32_t ioin = readRegister(ioinRegister);
@@ -544,11 +528,13 @@ bool enableOutput(const CurrentSettings& current, bool quiet)
 }
 }
 
+// Aplica la configuración seleccionada y habilita la salida si el driver está preparado.
 bool Tmc5160::enable()
 {
     return enableOutput(selectedCurrent, selectedSilentMode);
 }
 
+// Inicia el movimiento manual y guarda la velocidad y los tiempos de rampa para ajustes posteriores.
 bool Tmc5160::startJog(bool positive, uint32_t speed, uint32_t rampMs, uint32_t decelerationMs)
 {
     if (rampMs < minRampMs || rampMs > maxRampMs ||
@@ -563,6 +549,7 @@ bool Tmc5160::startJog(bool positive, uint32_t speed, uint32_t rampMs, uint32_t 
 
 namespace
 {
+// Recalcula la rampa desde la velocidad efectiva hacia el nuevo objetivo.
 bool retargetJogSpeed(uint32_t speed)
 {
     const uint32_t delayFromRest = waitingForFirstStep ? firstStepDelay(speed, jogRampMs) : 0;
@@ -591,9 +578,10 @@ bool retargetJogSpeed(uint32_t speed)
 }
 }
 
+// Valida la nueva velocidad y la guarda incluso si hay una inversión en curso.
 bool Tmc5160::changeJogSpeed(uint32_t speed)
 {
-    if (!moving || !continuousJog || isStopping() || speed < minJogSpeed || speed > maxJogSpeed())
+    if (!moving || isStopping() || speed < minJogSpeed || speed > maxJogSpeed())
     {
         return false;
     }
@@ -606,9 +594,10 @@ bool Tmc5160::changeJogSpeed(uint32_t speed)
     return reversing || retargetJogSpeed(speed);
 }
 
+// Decelera antes de invertir el sentido y permite volver al sentido activo durante la maniobra.
 bool Tmc5160::changeJogDirection(bool positive)
 {
-    if (!moving || !continuousJog || isStopping())
+    if (!moving || isStopping())
     {
         return false;
     }
@@ -638,10 +627,11 @@ bool Tmc5160::changeJogDirection(bool positive)
     return true;
 }
 
+// Renueva el plazo de seguridad con la interrupción momentáneamente desactivada.
 bool Tmc5160::renewJog()
 {
     noInterrupts();
-    const bool renewed = moving && continuousJog;
+    const bool renewed = moving;
     if (renewed)
     {
         ticksUntilTimeout = keepaliveTicks;
@@ -650,6 +640,7 @@ bool Tmc5160::renewJog()
     return renewed;
 }
 
+// Consultas de estado que alimentan el panel y la lógica de control.
 bool Tmc5160::isMoving()
 {
     return moving;
@@ -662,7 +653,7 @@ bool Tmc5160::isDecelerating()
 
 bool Tmc5160::isStopping()
 {
-    return moving && continuousJog && targetSpeed == 0 && !reversing;
+    return moving && targetSpeed == 0 && !reversing;
 }
 
 bool Tmc5160::isReversing()
@@ -685,6 +676,7 @@ bool Tmc5160::isEnabled()
 }
 
 
+// Resolución seleccionada y conversiones entre RPM, micropasos y límites de aceleración.
 uint16_t Tmc5160::microsteps()
 {
     return 256U >> microstepResolution;
@@ -715,6 +707,7 @@ uint32_t Tmc5160::maxJogAcceleration()
     return maxJogSpeed();
 }
 
+// Valida y selecciona una resolución mientras la salida está deshabilitada.
 bool Tmc5160::selectMicrosteps(uint16_t count)
 {
     if (outputCommanded || moving || count == 0 || count > 256 ||
@@ -732,6 +725,7 @@ bool Tmc5160::selectMicrosteps(uint16_t count)
     return true;
 }
 
+// Valores de corriente RMS que se muestran en el panel.
 uint16_t Tmc5160::runCurrentMa()
 {
     return selectedRunCurrentMa;
@@ -744,6 +738,7 @@ uint16_t Tmc5160::holdCurrentMa()
            (1000 * currentScale);
 }
 
+// Valida y guarda el ajuste de corriente de marcha.
 bool Tmc5160::selectRunCurrent(uint16_t milliamps)
 {
     if (outputCommanded || moving || milliamps < minRunCurrentMa ||
@@ -756,6 +751,7 @@ bool Tmc5160::selectRunCurrent(uint16_t milliamps)
     return true;
 }
 
+// Consultas del modo solicitado y del progreso del ajuste de StealthChop.
 bool Tmc5160::silentMode()
 {
     return selectedSilentMode;
@@ -766,6 +762,7 @@ bool Tmc5160::silentInitializing()
     return outputCommanded && quietSetupPending;
 }
 
+// Selecciona el modo de regulación con la salida deshabilitada.
 bool Tmc5160::selectSilentMode(bool enabled)
 {
     if (outputCommanded || moving)
@@ -776,6 +773,7 @@ bool Tmc5160::selectSilentMode(bool enabled)
     return true;
 }
 
+// Cancela la maniobra en curso y decelera hasta reposo manteniendo habilitada la salida.
 void Tmc5160::stop()
 {
     if (!moving || isStopping())
@@ -790,7 +788,7 @@ void Tmc5160::stop()
     }
 
     const uint32_t speed = pulseSpeed();
-    if (continuousJog && speed > 0)
+    if (speed > 0)
     {
         noInterrupts();
         requestedHalfPeriod = activeHalfPeriod;
@@ -804,6 +802,7 @@ void Tmc5160::stop()
     interrupts();
 }
 
+// Deshabilita la salida y cancela la generación de pasos.
 void Tmc5160::disable()
 {
     noInterrupts();

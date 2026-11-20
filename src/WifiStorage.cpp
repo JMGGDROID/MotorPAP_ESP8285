@@ -1,20 +1,24 @@
+// Guarda y recupera la red Wi-Fi en el sistema de archivos LittleFS de la placa.
 #include "WifiStorage.h"
 
 #include <LittleFS.h>
 
 namespace
 {
+// El nombre identifica la versión del formato almacenado.
 constexpr char credentialsPath[] = "/wifi-v1";
 constexpr char temporaryCredentialsPath[] = "/wifi-v1.tmp";
 bool storageReady = false;
 }
 
+// Monta LittleFS y registra si las escrituras están disponibles.
 bool WifiStorage::begin()
 {
     storageReady = LittleFS.begin();
     return storageReady;
 }
 
+// Comprueba el tamaño de la estructura, la lectura y la terminación de las cadenas.
 bool WifiStorage::load(WifiCredentials& credentials)
 {
     File file = LittleFS.open(credentialsPath, "r");
@@ -24,6 +28,7 @@ bool WifiStorage::load(WifiCredentials& credentials)
            credentials.password[sizeof(credentials.password) - 1] == '\0';
 }
 
+// Escribe primero un archivo temporal y lo renombra solo después de completar la escritura.
 bool WifiStorage::save(const WifiCredentials& credentials)
 {
     if (!storageReady)

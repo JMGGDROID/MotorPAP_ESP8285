@@ -1,3 +1,4 @@
+// Página del panel web embebida en el firmware. Contiene la interfaz, sus estilos y los comandos HTTP.
 #pragma once
 
 #include <pgmspace.h>
@@ -10,6 +11,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>MotorPAP · TMC5160</title>
   <style>
+    /* Variables de color y estilos base compartidos por todo el panel. */
     :root {
       font: 14px "Segoe UI", system-ui, sans-serif;
       color: #111b2d;
@@ -30,6 +32,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
     .brand-icon { color: #0875db; font-size: 3.1rem; line-height: 1; }
     .intro p, small { color: var(--muted); }
     .intro p { margin-top: .2rem; }
+    /* Distribución y aspecto de las tarjetas de estado. */
     .status-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .65rem; flex: 1 1 34rem; max-width: 56rem; }
     .card { background: linear-gradient(145deg, #fff, #f4f6f9); border: 1px solid var(--line); border-radius: .65rem; padding: .7rem .85rem; box-shadow: 0 1px 2px #182c4210; }
     .status-grid .card { display: flex; align-items: center; gap: .65rem; min-height: 4.7rem; }
@@ -43,6 +46,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
     .pill.pending { background: #fff1d5; color: #734810; }
     .pill.fault { background: #ffe1dd; color: #a4211c; }
     main { flex: 1; display: grid; grid-template-columns: minmax(0, 1.03fr) minmax(0, 1.08fr) minmax(0, 1fr); gap: .75rem; align-items: start; align-content: start; }
+    /* Espaciado de los grupos de ajustes y sus controles. */
     .stack { display: grid; gap: .65rem; min-width: 0; }
     fieldset { min-width: 0; border: 0; margin: 0; padding: 0; }
     .notice { grid-column: 1 / -1; margin: 0; padding: .45rem .75rem; background: #edf2f8; border: 1px solid var(--line); border-radius: .4rem; color: var(--muted); font-size: .86rem; }
@@ -67,6 +71,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
     .driver-toggle input:checked + .switch { background: #00a76a; }
     .driver-toggle input:focus-visible + .switch { outline: 2px solid var(--blue); outline-offset: 2px; }
     .driver-toggle input:not(:disabled) + .switch { cursor: pointer; }
+    /* Distribución de los indicadores y botones de movimiento. */
     .metrics, .actions { display: grid; grid-template-columns: 1fr 1fr; gap: .55rem; }
     .metrics .card { min-height: 5.15rem; }
     .metric { display: inline-block; color: #142238; font-size: 1.85rem; font-weight: 750; margin: .45rem .4rem 0 0; }
@@ -100,6 +105,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
     footer { background: linear-gradient(#203a5a, #172d48); color: #f1f5fa; }
     .foot { display: flex; flex-wrap: wrap; gap: .5rem 1.1rem; font-size: .86rem; }
     .foot span + span { border-left: 1px solid #6d8099; padding-left: 1.1rem; }
+    /* Adapta la distribución a pantallas medianas y estrechas. */
     @media (max-width: 68rem) {
       main { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .monitoring { grid-column: 1 / -1; grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -112,7 +118,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
   </style>
 </head>
 <body>
-  <header>
+<!-- Cabecera y tarjetas de estado de conexión, controlador, driver y motor. -->  <header>
     <div class="top">
       <div class="intro">
         <span class="brand-icon" aria-hidden="true">⚙︎</span>
@@ -127,13 +133,21 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       </div>
     </div>
   </header>
-  <main>
+<!-- Ajustes del motor, controles de movimiento y diagnóstico. -->  <main>
     <p class="notice" id="driver-notice">Habilita el driver para mover. STOP desacelera y mantiene la sujeción. Apaga el interruptor para liberar el motor.</p>
     <section class="stack" aria-label="Ajustes del motor" aria-describedby="driver-notice">
       <section class="card row" style="margin-top:0">
         <div><h2><span class="icon" aria-hidden="true">🔒︎</span>Habilitar driver</h2><small id="current-summary">0,80 A RMS en marcha · 0,40 A RMS en reposo</small></div>
         <label class="driver-toggle"><input id="driver-toggle" type="checkbox" role="switch" aria-label="Habilitar driver" disabled><span class="switch" id="driver-switch" aria-hidden="true">OFF</span></label>
       </section>
+<!-- Corriente RMS de marcha ajustable y valor de mantenimiento calculado por el firmware. -->      <fieldset class="card" id="current-controls" disabled>
+        <h2><span class="icon" aria-hidden="true">ϟ</span>Corriente del motor</h2>
+        <div class="choices">
+          <label>Marcha RMS<br><input id="run-current" type="number" min="0.10" max="1.20" step="0.01" value="0.80" required> A</label>
+          <label>Mantenimiento RMS<br><input id="hold-current" type="number" value="0.40" readonly> A</label>
+        </div>
+        <div class="row"><small>0,10 a 1,20 A RMS · Ajusta con el driver en OFF.</small><button type="button" id="apply-current">Aplicar</button></div>
+      </fieldset>
       <section class="card">
         <h2><span class="icon" aria-hidden="true">⟳</span>Sentido de giro</h2>
         <div class="choices">
@@ -188,17 +202,9 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
         <div><h2>Modo silencioso</h2><small id="chopper-mode">SpreadCycle · Ajusta con el driver en OFF.</small></div>
         <label class="driver-toggle"><input id="silent-mode-toggle" type="checkbox" role="switch" aria-label="Modo silencioso StealthChop" disabled><span class="switch" id="silent-mode-switch" aria-hidden="true">OFF</span></label>
       </section>
-      <fieldset class="card" id="current-controls" disabled>
-        <h2><span class="icon" aria-hidden="true">ϟ</span>Corriente del motor</h2>
-        <div class="choices">
-          <label>Marcha RMS<br><input id="run-current" type="number" min="0.10" max="1.20" step="0.01" value="0.80" required> A</label>
-          <label>Mantenimiento RMS<br><input id="hold-current" type="number" value="0.40" readonly> A</label>
-        </div>
-        <div class="row"><small>0,10 a 1,20 A RMS · Ajusta con el driver en OFF.</small><button type="button" id="apply-current">Aplicar</button></div>
-      </fieldset>
     </section>
     <div class="stack">
-      <fieldset class="card" aria-labelledby="movement" aria-describedby="driver-notice">
+<!-- Órdenes de movimiento manual y parada. -->      <fieldset class="card" aria-labelledby="movement" aria-describedby="driver-notice">
         <h2 id="movement"><span class="icon" aria-hidden="true">✥</span>Controles de movimiento</h2>
         <div class="actions jog">
           <button id="jog-negative" type="button" disabled><span class="button-icon" aria-hidden="true">←</span>Mover −<small>(Jog)</small></button>
@@ -242,11 +248,12 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       </section>
     </div>
   </main>
-  <footer><div class="foot">
+<!-- Dirección IP y tiempo de actividad de la placa. -->  <footer><div class="foot">
     <span>IP <strong id="ip">—</strong></span><span>SPI <strong id="spi-link">—</strong></span>
     <span>Tiempo activo <strong id="uptime">—</strong></span>
   </div></footer>
   <script>
+    // Referencias a controles y estado local de las órdenes del navegador.
     const byId = (id) => document.getElementById(id);
     let latestStatus = null;
     let pendingCommand = null;
@@ -276,11 +283,13 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
     const pulseFormat = new Intl.NumberFormat('es-ES');
     const currentFormat = new Intl.NumberFormat('es-ES', {minimumFractionDigits: 2, maximumFractionDigits: 2});
 
+    // Convierte la velocidad en micropasos por segundo a revoluciones por minuto.
     function formatRpm(pulseSpeed) {
       const rpm = pulseSpeed * 60 / (motorStepsPerRevolution * microstepsPerStep);
       return rpmFormat.format(rpm) + ' RPM';
     }
 
+    // Actualiza las RPM indicadas y los cálculos de ambas rampas.
     function updateTargetRpm() {
       byId('target-rpm').value = speedInput.validity.valid
         ? formatRpm(speedInput.valueAsNumber) : '—';
@@ -288,6 +297,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       updateRampRate(decelerationInput, 'ramp-deceleration');
     }
 
+    // Calcula la aceleración o deceleración media para la velocidad y el tiempo actuales.
     function updateRampRate(input, outputId) {
       const output = byId(outputId);
       if (!speedInput.validity.valid || !input.validity.valid) {
@@ -300,6 +310,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
         rpmFormat.format(pulses) + ' µpasos/s²';
     }
 
+    // Sincroniza el campo en segundos con un deslizador de escala logarítmica.
     function bindRampSlider(input, slider, outputId) {
       const minimum = Number(input.min);
       const span = Number(input.max) / minimum;
@@ -324,6 +335,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       syncSlider();
     }
 
+    // Habilita o bloquea los controles según el estado de conexión, driver y movimiento.
     function updateControls() {
       const busy = Boolean(latestStatus?.moving || pendingCommand || motionId !== null);
       const canJog = latestStatus?.driverResponding && latestStatus.stepDirMode &&
@@ -388,6 +400,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       }
     }
 
+    // Envía una orden POST e incluye la cabecera que exige el servidor.
     async function sendCommand(path, signal) {
       const response = await fetch(path, {
         method: 'POST',
@@ -400,23 +413,27 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       return response.text();
     }
 
+    // Comprueba si un Jog activo puede aceptar un ajuste de velocidad.
     function canChangeSpeed() {
       return motionId !== null && latestStatus?.driverEnabled && !latestStatus.stopping &&
         !stopPending && !driverPending;
     }
 
+    // Descarta los ajustes de velocidad pendientes al cerrar una sesión de movimiento.
     function cancelSpeedChange() {
       clearTimeout(speedTimer);
       speedTimer = null;
       pendingSpeed = null;
     }
 
+    // Agrupa los cambios rápidos del deslizador antes de enviarlos.
     function scheduleSpeedChange() {
       if (speedTimer === null && !speedRequestPending && pendingSpeed !== null) {
         speedTimer = setTimeout(applySpeedChange, 120);
       }
     }
 
+    // Envía el cambio definitivo de velocidad cuando termina la edición.
     function queueSpeedChange() {
       if (canChangeSpeed() && speedInput.validity.valid) {
         pendingSpeed = speedInput.valueAsNumber;
@@ -424,6 +441,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       }
     }
 
+    // Envía el último ajuste pendiente al Jog y respeta el identificador de la sesión.
     async function applySpeedChange() {
       speedTimer = null;
       if (!canChangeSpeed() || pendingSpeed === null) {
@@ -447,6 +465,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       }
     }
 
+    // Inicia un Jog o solicita una inversión en el movimiento manual activo.
     async function jog(direction) {
       if (canChangeSpeed()) {
         settingPending = true;
@@ -487,6 +506,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       }
     }
 
+    // Envía STOP y actualiza los controles mientras se confirma la orden.
     async function stopMotion() {
       stopPending = true;
       cancelSpeedChange();
@@ -508,6 +528,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       }
     }
 
+    // Envía el estado del interruptor de habilitación al servidor.
     async function changeDriver() {
       const enabled = driverToggle.checked;
       driverPending = true;
@@ -534,8 +555,10 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       }
     }
 
+    // Conecta el interruptor de habilitación con la orden del driver.
     driverToggle.addEventListener('change', changeDriver);
 
+    // Envía un ajuste y actualiza el panel con el resultado.
     async function changeSetting(name, value) {
       const directionId = name === 'direction' && canChangeSpeed() ? motionId : null;
       settingPending = true;
@@ -598,6 +621,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       });
     }
 
+    // Actualiza las tarjetas de conexión del panel.
     function setConnection(online) {
       byId('wifi').textContent = online ? 'Conectado' : 'Sin respuesta';
       byId('controller').textContent = online ? 'En línea' : 'Sin respuesta';
@@ -605,6 +629,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       byId('controller').classList.toggle('online', online);
     }
 
+    // Aplica el estado recibido del firmware a los controles del driver.
     function setDriver(status) {
       if (latestStatus?.stopping && status?.moving === false) {
         byId('motion-feedback').textContent = 'Movimiento detenido.';
@@ -626,6 +651,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       updateControls();
     }
 
+    // Traduce el estado de movimiento a etiquetas visibles para el usuario.
     function updateMotorCard(status) {
       let label = 'Sin datos';
       let level = '';
@@ -662,6 +688,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       reading.parentElement.dataset.level = level;
     }
 
+    // Muestra los diagnósticos disponibles y marca las alertas del driver.
     function updateDiagnostics(status) {
       if (!status?.diagnosticsAvailable) {
         for (const id of ['diag-temperature', 'diag-voltage', 'diag-stallguard', 'diag-error']) {
@@ -684,21 +711,19 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       else showDiagnostic('diag-stallguard', 'Esperando lectura en marcha');
     }
 
+    // Renueva el Jog activo, consulta el estado y repite el ciclo tras 500 ms. El servidor cachea los dBm.
     async function refreshStatus() {
+      const id = motionId;
       const request = new AbortController();
-      const timeout = setTimeout(() => request.abort(), 2500);
+      const timeout = setTimeout(() => request.abort(), id === null ? 2500 : 750);
       try {
-        const id = motionId;
         if (id !== null) {
           try {
             await sendCommand('/api/jog/keepalive?id=' + id, request.signal);
           } catch (error) {
-            if (motionId === id) {
+            if (motionId === id && error.status === 409) {
               motionId = null;
               cancelSpeedChange();
-              if (error.status !== 409) {
-                byId('motion-feedback').textContent = 'Se interrumpió la comunicación de movimiento.';
-              }
             }
           }
         }
@@ -716,7 +741,7 @@ constexpr char motorPanelHtml[] PROGMEM = R"HTML(
       } catch {
         setConnection(false);
         setDriver(null);
-        byId('signal').textContent = '— dBm';
+        byId('signal').textContent = 'Sin datos';
         byId('ip').textContent = '—';
         byId('uptime').textContent = '—';
       } finally {
