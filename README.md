@@ -4,6 +4,15 @@ Firmware para controlar un motor paso a paso desde un navegador en la red local.
 
 ![Panel web de control del motor paso a paso](./web.png)
 
+## Hardware necesario
+
+| Placa D1 Mini Pro | Driver TMC5160 |
+| --- | --- |
+| <img src="./D1%20Mini%20Pro.jpg" alt="Placa D1 Mini Pro" width="240"> | <img src="./TMC5160.png" alt="Módulo controlador TMC5160" width="240"> |
+| Ejecuta el firmware, aloja el panel web y genera las señales de control. | Controla el motor paso a paso mediante señales `STEP/DIR` y se configura por SPI. |
+
+También necesitas un motor paso a paso, una fuente de alimentación adecuada para el motor y el driver, un cable USB de datos para programar la placa y cables para las conexiones.
+
 ## Conexiones
 
 > [!WARNING]
