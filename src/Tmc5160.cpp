@@ -1,5 +1,7 @@
 // Controla el TMC5160 por SPI y genera los pulsos STEP/DIR del motor mediante Timer1.
 #include "Tmc5160.h"
+#include "EventLog.h"
+#include "GcodePlanner.h"
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -39,6 +41,7 @@ constexpr uint32_t chopperBase = 0x10410153; // Sin el campo MRES; TOFF=3.
 constexpr uint8_t microstepResolutionShift = 24;
 constexpr uint8_t expectedVersion = 0x30;
 constexpr uint32_t enableInputMask = 1UL << 4;
+constexpr uint32_t chopperOffTimeMask = 0x0f;
 constexpr uint32_t stepDirModeMask = 1UL << 6;
 // Cadencias del diagnóstico, las rampas y el límite de tiempo sin heartbeat del Jog.
 constexpr unsigned long pollInterval = 1000;
@@ -104,9 +107,20 @@ volatile uint32_t activeHalfPeriod = 0;
 volatile uint32_t requestedHalfPeriod = 0;
 volatile uint32_t firstStepTicksRemaining = 0;
 volatile bool waitingForFirstStep = false;
-volatile bool stepHigh = false;
+volatile bool stepActive = false;
+volatile uint8_t invertedPins = 0;
 volatile bool moving = false;
 volatile bool outputCommanded = false;
+volatile bool jogTimedOut = false;
+volatile int64_t positionUnits = 0;
+volatile int32_t positionIncrement = 0;
+volatile uint32_t positionPulsesLeft = 0;
+volatile bool positioning = false;
+bool plannedPositioning = false;
+volatile bool positionReached = false;
+int64_t positionTargetUnits = 0;
+int64_t homePositionUnits = 0;
+bool hasPositionTarget = false;
 uint32_t targetSpeed = 0;
 uint32_t selectedJogSpeed = 0;
 bool activeDirection = false;
@@ -124,18 +138,49 @@ Tmc5160::Status currentStatus{};
 unsigned long lastPoll = 0;
 bool firstPoll = true;
 
-// Detiene el temporizador y deja STEP en bajo. Puede deshabilitar también la salida.
+void IRAM_ATTR writeEnablePin(bool enabled)
+{
+    if (enabled == bool(invertedPins & Tmc5160::invertEnable))
+    {
+        GPOS = 1UL << enablePin;
+    }
+    else
+    {
+        GPOC = 1UL << enablePin;
+    }
+}
+
+// D0 es GPIO16, con un registro de salida propio.
+void IRAM_ATTR writeStepPin(bool active)
+{
+    if (active != bool(invertedPins & Tmc5160::invertStep))
+    {
+        GP16O |= 1U;
+    }
+    else
+    {
+        GP16O &= ~1U;
+    }
+}
+
+void writeDirectionPin(bool positive)
+{
+    digitalWrite(directionPin, positive != bool(invertedPins & Tmc5160::invertDirection) ? HIGH : LOW);
+}
+
+// Detiene el temporizador y devuelve STEP a su nivel de reposo.
 void IRAM_ATTR stopPulses(bool disableOutput)
 {
     if (disableOutput)
     {
-        GPOS = 1UL << enablePin;
+        writeEnablePin(false);
         outputCommanded = false;
     }
     timer1_disable();
-    GP16O &= ~1U;
-    stepHigh = false;
+    writeStepPin(false);
+    stepActive = false;
     moving = false;
+    positioning = false;
 }
 
 // Supervisa el plazo del Jog y alterna STEP. Aplica el nuevo período al completar un pulso.
@@ -148,6 +193,7 @@ void IRAM_ATTR onStepTimer()
 
     if (ticksUntilTimeout <= activeHalfPeriod)
     {
+        jogTimedOut = true;
         stopPulses(true);
         return;
     }
@@ -171,17 +217,28 @@ void IRAM_ATTR onStepTimer()
         timer1_write(activeHalfPeriod);
     }
 
-    // D0 es GPIO16, con un registro de salida propio.
-    if (stepHigh)
+    if (stepActive)
     {
-        GP16O &= ~1U;
+        writeStepPin(false);
+        // Completa el pulso final antes de detener el temporizador.
+        if (positioning && positionPulsesLeft == 0)
+        {
+            positionReached = true;
+            stopPulses(false);
+            return;
+        }
     }
     else
     {
-        GP16O |= 1U;
+        writeStepPin(true);
+        positionUnits += positionIncrement;
+        if (positioning)
+        {
+            --positionPulsesLeft;
+        }
     }
-    stepHigh = !stepHigh;
-    if (!stepHigh && activeHalfPeriod != requestedHalfPeriod)
+    stepActive = !stepActive;
+    if (!stepActive && activeHalfPeriod != requestedHalfPeriod)
     {
         activeHalfPeriod = requestedHalfPeriod;
         timer1_write(activeHalfPeriod);
@@ -269,17 +326,11 @@ bool restartJogFromRest()
     }
 
     timer1_disable();
-    GP16O &= ~1U;
-    stepHigh = false;
-    if (requestedDirection)
-    {
-        GPOS = 1UL << directionPin;
-    }
-    else
-    {
-        GPOC = 1UL << directionPin;
-    }
+    writeStepPin(false);
+    stepActive = false;
+    writeDirectionPin(requestedDirection);
     activeDirection = requestedDirection;
+    positionIncrement = requestedDirection ? abs(positionIncrement) : -abs(positionIncrement);
     waitingForFirstStep = true;
     firstStepTicksRemaining = firstDelay;
     activeHalfPeriod = startupTick;
@@ -296,7 +347,7 @@ bool restartJogFromRest()
 // Interpola la velocidad y aplica el final de rampa, incluida la parada o la inversión.
 void updateRamp(unsigned long now)
 {
-    if (!moving || rampFinished ||
+    if (!moving || (rampFinished && !positioning) ||
         now - lastRampUpdate < rampInterval)
     {
         return;
@@ -316,9 +367,23 @@ void updateRamp(unsigned long now)
         interrupts();
         return;
     }
-    const uint32_t speed = rampFinished ? targetSpeed
+    uint32_t speed = rampFinished ? targetSpeed
         : (uint64_t(rampFromSpeed) * (rampDurationMs - elapsed) +
            uint64_t(targetSpeed) * elapsed) / rampDurationMs;
+    if (positioning)
+    {
+        // v² = 2ad. Limita la velocidad en función de la distancia pendiente.
+        constexpr uint32_t minTimerSpeed = (timerFrequency + 2 * maxTimerTicks - 1) / (2 * maxTimerTicks);
+        if (plannedPositioning && GcodePlanner::state() == GcodePlanner::State::running)
+        {
+            speed = max(minTimerSpeed, GcodePlanner::profileSpeed(Tmc5160::position().units));
+        }
+        else
+        {
+            const double brakingSpeed = sqrt(2000.0 * selectedJogSpeed * positionPulsesLeft / jogDecelerationMs);
+            speed = min(speed, max(minTimerSpeed, static_cast<uint32_t>(brakingSpeed)));
+        }
+    }
     if (speed > 0)
     {
         const uint32_t period = halfPeriodForSpeed(speed);
@@ -345,8 +410,7 @@ uint32_t chopperConfig()
 // Prepara los pines con la salida deshabilitada, arranca SPI y conecta la interrupción de Timer1.
 void Tmc5160::begin()
 {
-    digitalWrite(enablePin, HIGH);
-    pinMode(enablePin, OUTPUT);
+    pinMode(enablePin, INPUT_PULLUP);
     digitalWrite(chipSelectPin, HIGH);
     pinMode(chipSelectPin, OUTPUT);
     digitalWrite(stepPin, LOW);
@@ -354,12 +418,32 @@ void Tmc5160::begin()
     digitalWrite(directionPin, LOW);
     pinMode(directionPin, OUTPUT);
     SPI.begin(); // D5 SCK, D6 MISO y D7 MOSI.
+    if (validStepDir(readRegister(ioinRegister)))
+    {
+        writeRegister(chopperRegister, chopperConfig() & ~chopperOffTimeMask);
+    }
+    digitalWrite(enablePin, HIGH);
+    pinMode(enablePin, OUTPUT);
     timer1_attachInterrupt(onStepTimer);
 }
 
 // Atiende la rampa, completa el ajuste silencioso y comprueba periódicamente el enlace SPI y los diagnósticos.
 void Tmc5160::update()
 {
+    noInterrupts();
+    const bool timedOut = jogTimedOut;
+    jogTimedOut = false;
+    const bool reached = positionReached;
+    positionReached = false;
+    interrupts();
+    if (timedOut)
+    {
+        EventLog::add("Driver OFF: movimiento sin renovación (keepalive) durante 3 s.");
+    }
+    if (reached)
+    {
+        EventLog::add("Posición objetivo alcanzada.");
+    }
     const unsigned long now = millis();
     if (quietSetupPending && outputCommanded && now - quietSetupStarted >= quietSetupMs)
     {
@@ -400,11 +484,31 @@ void Tmc5160::update()
     if (!nextStatus.responding || !nextStatus.stepDirMode ||
         (outputCommanded && nextStatus.outputDisabled))
     {
-        disable();
+        const char* reason = !nextStatus.responding ? "el TMC5160 dejó de responder por SPI"
+                           : !nextStatus.stepDirMode ? "el TMC5160 salió del modo STEP/DIR"
+                                                     : "EN apareció alto con la salida habilitada";
+        char message[96];
+        snprintf(message, sizeof(message), "%s (IOIN=0x%08lX)", reason, static_cast<unsigned long>(ioin));
+        disable(message);
+    }
+    if (hasDiagnostics &&
+        (nextStatus.overtemperature != currentStatus.overtemperature ||
+         nextStatus.temperatureWarning != currentStatus.temperatureWarning ||
+         nextStatus.undervoltage != currentStatus.undervoltage ||
+         nextStatus.driverError != currentStatus.driverError ||
+         nextStatus.shortCircuit != currentStatus.shortCircuit))
+    {
+        EventLog::add("Diagnóstico: temperatura=%s, UV=%u, error=%u, cortocircuito=%u.",
+                      nextStatus.overtemperature ? "alta" : nextStatus.temperatureWarning ? "preaviso" : "normal",
+                      unsigned(nextStatus.undervoltage), unsigned(nextStatus.driverError),
+                      unsigned(nextStatus.shortCircuit));
     }
     if (firstPoll || nextStatus.responding != currentStatus.responding ||
         nextStatus.outputDisabled != currentStatus.outputDisabled)
     {
+        EventLog::add("TMC5160 SPI: %s (IOIN=0x%08lX).",
+                      nextStatus.responding ? "identificado" : "sin identificar",
+                      static_cast<unsigned long>(ioin));
         Serial.printf("TMC5160 SPI: %s | IOIN=0x%08lX\n",
                       nextStatus.responding ? "identificado" : "sin identificacion",
                       static_cast<unsigned long>(ioin));
@@ -422,10 +526,13 @@ Tmc5160::Status Tmc5160::status()
 namespace
 {
 // Configura el sentido, prepara el temporizador y lanza la rampa desde reposo.
-bool startMotion(bool positive, uint32_t speed, uint32_t rampMs)
+bool startMotion(bool positive, uint32_t speed, uint32_t rampMs, uint32_t decelerationMs,
+                 uint32_t positionPulses = 0, bool planned = false)
 {
-    if (moving || !outputCommanded || quietSetupPending || speed < Tmc5160::minJogSpeed ||
-        speed > Tmc5160::maxJogSpeed())
+    if (moving || (!planned && GcodePlanner::state() == GcodePlanner::State::running) ||
+        !outputCommanded || quietSetupPending || speed < Tmc5160::minJogSpeed ||
+        speed > Tmc5160::maxJogSpeed() || rampMs < Tmc5160::minRampMs || rampMs > Tmc5160::maxRampMs ||
+        decelerationMs < Tmc5160::minRampMs || decelerationMs > Tmc5160::maxRampMs)
     {
         return false;
     }
@@ -435,15 +542,21 @@ bool startMotion(bool positive, uint32_t speed, uint32_t rampMs)
         readRegister(chopperRegister) != chopperConfig() ||
         ((readRegister(globalConfigRegister) & enableQuietMask) != 0) != activeSilentMode)
     {
-        Tmc5160::disable();
+        Tmc5160::disable("falló la comprobación de registros al iniciar el movimiento");
         return false;
     }
 
-    digitalWrite(directionPin, positive ? HIGH : LOW);
+    writeDirectionPin(positive);
     activeDirection = requestedDirection = positive;
     reversing = false;
     selectedJogSpeed = speed;
     jogRampMs = rampMs;
+    jogDecelerationMs = decelerationMs;
+    const int32_t increment = Tmc5160::positionUnitsPerStep / Tmc5160::microsteps();
+    positionIncrement = positive ? increment : -increment;
+    positionPulsesLeft = positionPulses;
+    positioning = positionPulses != 0;
+    plannedPositioning = planned;
     setSpeedRamp(0, speed, rampMs);
     ticksUntilTimeout = keepaliveTicks;
     waitingForFirstStep = true;
@@ -465,7 +578,7 @@ bool enableOutput(const CurrentSettings& current, bool quiet)
     const uint32_t ioin = readRegister(ioinRegister);
     if (!validStepDir(ioin))
     {
-        Tmc5160::disable();
+        Tmc5160::disable("TMC5160 sin respuesta SPI o fuera de modo STEP/DIR al habilitar");
         return false;
     }
     if (outputCommanded)
@@ -474,7 +587,7 @@ bool enableOutput(const CurrentSettings& current, bool quiet)
         {
             return true;
         }
-        Tmc5160::disable();
+        Tmc5160::disable("EN alto durante la comprobación de habilitación");
         return false;
     }
     if ((ioin & enableInputMask) == 0)
@@ -511,11 +624,11 @@ bool enableOutput(const CurrentSettings& current, bool quiet)
         return false;
     }
 
-    digitalWrite(enablePin, LOW);
+    writeEnablePin(true);
     const uint32_t enabledIoin = readRegister(ioinRegister);
     if (!validStepDir(enabledIoin) || (enabledIoin & enableInputMask) != 0)
     {
-        Tmc5160::disable();
+        Tmc5160::disable("falló la lectura de confirmación al habilitar");
         return false;
     }
     activeSilentMode = quiet;
@@ -537,13 +650,70 @@ bool Tmc5160::enable()
 // Inicia el movimiento manual y guarda la velocidad y los tiempos de rampa para ajustes posteriores.
 bool Tmc5160::startJog(bool positive, uint32_t speed, uint32_t rampMs, uint32_t decelerationMs)
 {
-    if (rampMs < minRampMs || rampMs > maxRampMs ||
-        decelerationMs < minRampMs || decelerationMs > maxRampMs ||
-        !startMotion(positive, speed, rampMs))
+    return startMotion(positive, speed, rampMs, decelerationMs);
+}
+
+Tmc5160::Position Tmc5160::position()
+{
+    noInterrupts();
+    const Position result{positionUnits, positionTargetUnits, homePositionUnits, hasPositionTarget, positioning};
+    interrupts();
+    return result;
+}
+
+int32_t Tmc5160::signedPulseSpeed()
+{
+    const auto speed = static_cast<int32_t>(pulseSpeed());
+    return activeDirection ? speed : -speed;
+}
+
+namespace
+{
+bool moveToUnits(int64_t goal, uint32_t speed, uint32_t rampMs, uint32_t decelerationMs, bool planned = false)
+{
+    if (moving || (!planned && GcodePlanner::state() == GcodePlanner::State::running) ||
+        !outputCommanded || quietSetupPending)
     {
         return false;
     }
-    jogDecelerationMs = decelerationMs;
+    const int64_t delta = goal - Tmc5160::position().units;
+    const int64_t increment = Tmc5160::positionUnitsPerStep / Tmc5160::microsteps();
+    const uint64_t pulses = (delta < 0 ? -delta : delta) / increment;
+    if (pulses > UINT32_MAX || delta % increment != 0 ||
+        (pulses != 0 && !startMotion(delta > 0, speed, rampMs, decelerationMs, static_cast<uint32_t>(pulses), planned)))
+    {
+        return false;
+    }
+    positionTargetUnits = goal;
+    hasPositionTarget = true;
+    return true;
+}
+}
+
+bool Tmc5160::moveToPosition(int32_t steps, uint32_t speed, uint32_t rampMs, uint32_t decelerationMs)
+{
+    return steps >= -maxPositionSteps && steps <= maxPositionSteps &&
+           moveToUnits(int64_t(steps) * positionUnitsPerStep, speed, rampMs, decelerationMs);
+}
+
+bool Tmc5160::movePlanned(int32_t steps, uint32_t speed, uint32_t rampMs, uint32_t decelerationMs)
+{
+    return steps >= -maxPositionSteps && steps <= maxPositionSteps &&
+           moveToUnits(int64_t(steps) * positionUnitsPerStep, speed, rampMs, decelerationMs, true);
+}
+
+bool Tmc5160::moveHome(uint32_t speed, uint32_t rampMs, uint32_t decelerationMs)
+{
+    return moveToUnits(homePositionUnits, speed, rampMs, decelerationMs);
+}
+
+bool Tmc5160::setHomePosition()
+{
+    if (moving)
+    {
+        return false;
+    }
+    homePositionUnits = position().units;
     return true;
 }
 
@@ -581,7 +751,7 @@ bool retargetJogSpeed(uint32_t speed)
 // Valida la nueva velocidad y la guarda incluso si hay una inversión en curso.
 bool Tmc5160::changeJogSpeed(uint32_t speed)
 {
-    if (!moving || isStopping() || speed < minJogSpeed || speed > maxJogSpeed())
+    if (!moving || positioning || isStopping() || speed < minJogSpeed || speed > maxJogSpeed())
     {
         return false;
     }
@@ -597,7 +767,7 @@ bool Tmc5160::changeJogSpeed(uint32_t speed)
 // Decelera antes de invertir el sentido y permite volver al sentido activo durante la maniobra.
 bool Tmc5160::changeJogDirection(bool positive)
 {
-    if (!moving || isStopping())
+    if (!moving || positioning || isStopping())
     {
         return false;
     }
@@ -648,6 +818,10 @@ bool Tmc5160::isMoving()
 
 bool Tmc5160::isDecelerating()
 {
+    if (moving && plannedPositioning && GcodePlanner::state() == GcodePlanner::State::running)
+    {
+        return !waitingForFirstStep && requestedHalfPeriod > activeHalfPeriod;
+    }
     return moving && !rampFinished && targetSpeed < rampFromSpeed;
 }
 
@@ -661,15 +835,6 @@ bool Tmc5160::isReversing()
     return moving && reversing;
 }
 
-bool Tmc5160::jogDirection()
-{
-    return activeDirection;
-}
-
-bool Tmc5160::requestedJogDirection()
-{
-    return requestedDirection;
-}
 bool Tmc5160::isEnabled()
 {
     return outputCommanded;
@@ -721,7 +886,62 @@ bool Tmc5160::selectMicrosteps(uint16_t count)
     {
         ++resolution;
     }
-    microstepResolution = resolution;
+    if (resolution != microstepResolution)
+    {
+        positionUnits = 0;
+        homePositionUnits = 0;
+        hasPositionTarget = false;
+        microstepResolution = resolution;
+    }
+    return true;
+}
+
+uint8_t Tmc5160::pinInversions()
+{
+    return invertedPins;
+}
+
+bool Tmc5160::selectPinInversions(uint8_t mask)
+{
+    if (outputCommanded || moving || (mask & ~allPinInversions) != 0)
+    {
+        return false;
+    }
+
+    const uint8_t previous = invertedPins;
+    const uint8_t changed = previous ^ mask;
+    if (changed & invertEnable)
+    {
+        if (!validStepDir(readRegister(ioinRegister)))
+        {
+            return false;
+        }
+        // Antes de probar el nivel inactivo de EN, apaga las etapas de potencia por SPI.
+        const uint32_t disabledChopper = chopperConfig() & ~chopperOffTimeMask;
+        writeRegister(chopperRegister, disabledChopper);
+        if (readRegister(chopperRegister) != disabledChopper)
+        {
+            return false;
+        }
+        invertedPins = mask;
+        writeEnablePin(false);
+        const uint32_t ioin = readRegister(ioinRegister);
+        if (!validStepDir(ioin) || (ioin & enableInputMask) == 0)
+        {
+            invertedPins = previous;
+            writeEnablePin(false);
+            return false;
+        }
+    }
+    invertedPins = mask;
+    writeStepPin(false);
+    writeDirectionPin(activeDirection);
+    if (changed & (invertDirection | invertStep))
+    {
+        positionUnits = 0;
+        homePositionUnits = 0;
+        hasPositionTarget = false;
+    }
     return true;
 }
 
@@ -776,6 +996,7 @@ bool Tmc5160::selectSilentMode(bool enabled)
 // Cancela la maniobra en curso y decelera hasta reposo manteniendo habilitada la salida.
 void Tmc5160::stop()
 {
+    GcodePlanner::cancel();
     if (!moving || isStopping())
     {
         return;
@@ -803,9 +1024,15 @@ void Tmc5160::stop()
 }
 
 // Deshabilita la salida y cancela la generación de pasos.
-void Tmc5160::disable()
+void Tmc5160::disable(const char* reason)
 {
+    GcodePlanner::cancel();
     noInterrupts();
+    const bool wasEnabled = outputCommanded;
     stopPulses(true);
     interrupts();
+    if (wasEnabled)
+    {
+        EventLog::add("Driver OFF: %s.", reason);
+    }
 }

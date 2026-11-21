@@ -14,6 +14,21 @@ constexpr uint32_t maxRampMs = 600000;
 constexpr uint16_t minRunCurrentMa = 100;
 constexpr uint16_t maxRunCurrentMa = 1200;
 constexpr uint16_t defaultRunCurrentMa = 800;
+constexpr int32_t maxPositionSteps = 1000000;
+constexpr int32_t positionUnitsPerStep = 256;
+constexpr uint8_t invertDirection = 1;
+constexpr uint8_t invertEnable = 2;
+constexpr uint8_t invertStep = 4;
+constexpr uint8_t allPinInversions = invertDirection | invertEnable | invertStep;
+
+struct Position
+{
+    int64_t units;
+    int64_t targetUnits;
+    int64_t homeUnits;
+    bool hasTarget;
+    bool positioning;
+};
 
 // Diagnóstico de la última lectura SPI. Un resultado StallGuard negativo indica que no está disponible.
 struct Status
@@ -37,6 +52,16 @@ void update();
 Status status();
 // Operaciones del movimiento manual. renewJog() mantiene activa la sesión mientras llegan órdenes.
 bool startJog(bool positive, uint32_t speed, uint32_t rampMs, uint32_t decelerationMs);
+// Posición absoluta en pasos completos, estimada a partir de los pulsos STEP.
+bool moveToPosition(int32_t steps, uint32_t speed, uint32_t rampMs, uint32_t decelerationMs);
+bool movePlanned(int32_t steps, uint32_t speed, uint32_t rampMs, uint32_t decelerationMs);
+bool moveHome(uint32_t speed, uint32_t rampMs, uint32_t decelerationMs);
+bool setHomePosition();
+Position position();
+// Velocidad con signo a partir de la frecuencia de los pulsos STEP.
+int32_t signedPulseSpeed();
+uint8_t pinInversions();
+bool selectPinInversions(uint8_t mask);
 bool changeJogSpeed(uint32_t speed);
 bool changeJogDirection(bool positive);
 bool renewJog();
@@ -45,8 +70,6 @@ bool isMoving();
 bool isDecelerating();
 bool isStopping();
 bool isReversing();
-bool jogDirection();
-bool requestedJogDirection();
 // Resolución y límites que dependen de los micropasos configurados.
 uint16_t microsteps();
 uint16_t maxJogRpm();
@@ -69,7 +92,7 @@ bool selectSilentMode(bool enabled);
 bool enable();
 bool isEnabled();
 // Corta los pulsos y deshabilita la salida.
-void disable();
+void disable(const char* reason);
 // Solicita una parada con rampa y mantiene la sujeción.
 void stop();
 }

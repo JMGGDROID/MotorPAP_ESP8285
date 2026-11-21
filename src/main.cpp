@@ -1,6 +1,8 @@
 // Punto de entrada del firmware. Coordina el motor, el menú serie y el servicio web.
 #include <Arduino.h>
 
+#include "EventLog.h"
+#include "GcodePlanner.h"
 #include "MotorWebServer.h"
 #include "Tmc5160.h"
 #include "WifiConnection.h"
@@ -12,6 +14,7 @@ void setup()
     Tmc5160::begin();
     Serial.begin(115200);
     Serial.println("\nMotorPAP - ESP8285 iniciado");
+    EventLog::add("ESP8285 iniciado. Motivo de reinicio: %s", ESP.getResetReason().c_str());
     Tmc5160::update();
 
     WifiMenu::begin();
@@ -26,6 +29,7 @@ void setup()
 void loop()
 {
     Tmc5160::update();
+    GcodePlanner::update();
     WifiMenu::update();
     if (WifiConnection::update())
     {

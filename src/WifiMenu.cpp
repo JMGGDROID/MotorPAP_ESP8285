@@ -3,6 +3,7 @@
 
 #include <ESP8266WiFi.h>
 
+#include "EventLog.h"
 #include "Tmc5160.h"
 #include "WifiConnection.h"
 #include "WifiStorage.h"
@@ -92,8 +93,14 @@ void WifiMenu::begin()
 // Deja el motor deshabilitado durante el escaneo y muestra señal, canal y tipo de red.
 void WifiMenu::showNetworks()
 {
-    Tmc5160::disable();
+    if (WiFi.scanComplete() == WIFI_SCAN_RUNNING)
+    {
+        Serial.println("Hay una busqueda Wi-Fi en curso. Envia R cuando termine.");
+        return;
+    }
+    Tmc5160::disable("menú Wi-Fi por puerto serie");
     WifiConnection::disconnect();
+    EventLog::add("Buscando redes Wi-Fi desde el menú serie.");
     state = State::SelectNetwork;
     Serial.println("\nBuscando redes Wi-Fi de 2,4 GHz...");
     networkCount = WiFi.scanNetworks();
